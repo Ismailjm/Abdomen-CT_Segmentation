@@ -65,11 +65,20 @@ def transform_to_csv(data_root):
     return annotations
 
 
-def extract_slices(in_set, organs):
+def extract_slices(in_set, organ_list):
+    """
+    Extract slices containing specific organs from the dataset.
+    Args:
+        in_set (list): list of dictionaries containing the images and their masks with a list of organs available in each scan.
+        organ_list (list): list of organs to include in the output
+    Returns:
+        out_set (list): list of dictionaries containing the images, masks, organ, and slice indices.
+    """
+
     out_set = []
     key_to_organ, organ_to_key = organ_mapper()
     for row in in_set:
-        for organ in organs:
+        for organ in organ_list:
             organ_key = organ_to_key.get(organ)
             if organ_key is None:
                 print(f"Organ {organ} not found in organ mapping. Skipping.")
@@ -98,14 +107,14 @@ def extract_slices(in_set, organs):
     return out_set
 
 
-def create_dataset(annotations, organs, train_size, seed=42):
+def create_dataset(annotations, organ_list, train_size, data_path, seed=42):
     """
-    Load a specific number of slices from the BTCV dataset.
+    Create a dataset from the annotations.
     Args:
-        n_slices (int): Number of slices to load.
-
-    Returns:
-        slices_df (list): List of loaded slices.
+        annotations (list): list of dictionaries containing the images and their masks with a list of organs available in each scan.
+        organ_list (list): list of organs to include in the dataset.
+        train_size (int): number of samples to include in the training set.
+        seed (int): random seed for reproducibility.
     """
     random.seed(seed)
     # split the dataset to train and test sets
@@ -114,8 +123,8 @@ def create_dataset(annotations, organs, train_size, seed=42):
     test_df = [ann for ann in annotations if ann not in train_df]
 
     # create train & test flattened sets
-    train_set = extract_slices(train_df, organs)
-    test_set = extract_slices(test_df, organs)
+    train_set = extract_slices(train_df, organ_list)
+    test_set = extract_slices(test_df, organ_list)
 
     if not os.path.exists(os.path.join(data_path, "split")):
         os.makedirs(os.path.join(data_path, "split"))
@@ -139,5 +148,5 @@ if __name__ == "__main__":
 
     annnotations = transform_to_csv(data_path)
     train_set, test_set = create_dataset(
-        annnotations, organs_list, train_size=18, seed=42
+        annnotations, organs_list, data_path, train_size=18, seed=42
     )
