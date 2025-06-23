@@ -29,11 +29,11 @@ def organ_mapper():
     return key_to_organ, organ_to_key
 
 
-def transform_to_csv(data_root):
+def transform_to_csv(data_path):
     """
     Transform the BTCV dataset to a csv file.
     Args:
-        data_root (str): path to the BTCV dataset.
+        data_path (str): path to the BTCV dataset.
 
     Returns:
         annotations (list): list of dictionaries containing the images and their masks with a list of organs available in each scan.
@@ -41,10 +41,7 @@ def transform_to_csv(data_root):
     """
 
     annotations = []
-    # images_dir = os.path.join(data_root, "imagesTr")
-    # masks_dir = os.path.join(data_root, "labelsTr")
-    # imgs = [images_dir + "/" + f for f in sorted(os.listdir(images_dir))]
-    # masks = [masks_dir + "/" + f for f in sorted(os.listdir(masks_dir))]
+
     img_dir = os.path.join(data_path, "imagesTr")
     masks_dir = os.path.join(data_path, "labelsTr")
     imgs = Path(img_dir).glob("*.nii.gz")
@@ -60,7 +57,7 @@ def transform_to_csv(data_root):
 
     annotations_df = pd.DataFrame(annotations)
     # Save to CSV
-    annotations_df.to_csv(os.path.join(data_root, "dataset.csv"), index=False, sep=",")
+    annotations_df.to_csv(os.path.join(data_path, "dataset.csv"), index=False, sep=",")
 
     return annotations
 
