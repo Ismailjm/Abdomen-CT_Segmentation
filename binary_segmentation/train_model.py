@@ -96,7 +96,9 @@ def save_progress_plots(history, epoch, num_epochs, organ_name, output_dir):
 
 # Custom dataset for BTCV slices
 class BTCVSliceDataset(Dataset):
-    def __init__(self, dataset, organ_name, transform=None, binary=True):
+    def __init__(
+        self, dataset, organ_name, transform=None, organ_threshold=0.02, binary=True
+    ):
         """
         Args:
             dataset: List of dictionaries with volume_path, mask_path, organ, slices_idx
@@ -107,11 +109,15 @@ class BTCVSliceDataset(Dataset):
         self.dataset = dataset
         self.organ_name = organ_name
         self.transform = transform
+        self.organ_threshold = organ_threshold
         self.binary = binary
 
         self.volumes = {}
         self.masks = {}
         # Get unique vlomues/masks paths
+        key_to_organ, organ_to_key = organ_mapper()
+        organ_key = organ_to_key[organ_name.lower()]
+
         unique_volumes_paths = dataset["img_path"].unique()
         unique_masks_paths = dataset["mask_path"].unique()
         for path in tqdm(unique_volumes_paths, desc="Loading volumes"):
@@ -120,17 +126,33 @@ class BTCVSliceDataset(Dataset):
         for path in tqdm(unique_masks_paths, desc="Loading masks"):
             self.masks[path] = nib.load(path).get_fdata(dtype=np.float32)
         # Flatten the dataset to access slices directly
+
+        total_slices_found = 0
+        slices_kept = 0
         self.slices = []
         for _, item in dataset.iterrows():
             if item["organ"].lower() == organ_name.lower():
+                masks_data = self.masks[item["mask_path"]]
                 for slice_idx in range(item["begin_slice"], item["end_slice"] + 1):
-                    self.slices.append(
-                        {
-                            "img_path": item["img_path"],
-                            "mask_path": item["mask_path"],
-                            "slice_idx": slice_idx,
-                        }
+                    total_slices_found += 1
+
+                    mask_slice_array = masks_data[:, :, slice_idx]
+                    binary_mask_for_organ = mask_slice_array == organ_key
+
+                    organ_perc = (
+                        binary_mask_for_organ.sum() / binary_mask_for_organ.size
                     )
+
+                    # Only add the slice if it meets the threshold
+                    if organ_perc >= self.organ_threshold:
+                        slices_kept += 1
+                        self.slices.append(
+                            {
+                                "img_path": item["img_path"],
+                                "mask_path": item["mask_path"],
+                                "slice_idx": slice_idx,
+                            }
+                        )
 
     def __len__(self):
         return len(self.slices)
@@ -194,13 +216,11 @@ def train_model(
         "train_dice_scores": [],
         "val_dice_scores": [],
     }
-    output_dir = (
-        Path(output_dir) / f"{organ_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     total_start_time = time.time()
     print("Starting model training...")
+    print(f"Size of training set: {train_loader.dataset.__len__()}")
+    print(f"Size of validation set: {val_loader.dataset.__len__()}")
 
     print(f"Early stopping enabled with patience of {patience} epochs.")
     # Training loop
@@ -222,8 +242,8 @@ def train_model(
             running_dice = 0.0
 
             # Iterate over data
-            for inputs, masks in tqdm(dataloader):
-                inputs = inputs.to(device)
+            for volumes, masks in tqdm(dataloader):
+                volumes = volumes.to(device)
                 masks = masks.to(device)
 
                 # Zero the gradients
@@ -231,7 +251,7 @@ def train_model(
 
                 # Forward pass
                 with torch.set_grad_enabled(phase == "train"):
-                    outputs = model(inputs)
+                    outputs = model(volumes)
                     probs = torch.sigmoid(outputs)
                     preds = (probs > 0.5).float()
 
@@ -247,8 +267,8 @@ def train_model(
                         optimizer.step()
 
                 # Statistics
-                running_loss += loss.item() * inputs.size(0)
-                running_dice += dice * inputs.size(0)
+                running_loss += loss.item() * volumes.size(0)
+                running_dice += dice * volumes.size(0)
 
             # Calculate epoch metrics
             epoch_loss = running_loss / len(dataloader.dataset)
@@ -263,29 +283,26 @@ def train_model(
             else:
                 history["val_loss"].append(epoch_loss)
                 history["val_dice_scores"].append(epoch_dice.cpu())
-                # Save best model
-                if epoch_loss < best_val_loss:
-                    best_val_loss = epoch_loss
-                    patience_counter = 0
-                    # Save the best model
-                    torch.save(
-                        model.state_dict(), output_dir / f"best_unet_{organ_name}.pth"
-                    )
-                    print(f"New best model saved with val loss: {best_val_loss:.4f}")
-                else:
-                    patience_counter += 1
-                    print(
-                        f"No improvement in validation loss. Patience counter: {patience_counter}/{patience}"
-                    )
-                if patience_counter >= patience:
-                    print(
-                        f"Early stopping triggered. No improvement for {patience} epochs."
-                    )
-                    break
 
-            # Print progress
+            # Save progress plots
             print(f"\nSaving progress plots at epoch {epoch + 1}...")
             save_progress_plots(history, epoch, num_epochs, organ_name, output_dir)
+
+        # Save best model
+        if epoch_loss < best_val_loss:
+            best_val_loss = epoch_loss
+            patience_counter = 0
+            # Save the best model
+            torch.save(model.state_dict(), output_dir / f"best_unet_{organ_name}.pth")
+            print(f"New best model saved with val loss: {best_val_loss:.4f}")
+        else:
+            patience_counter += 1
+            print(
+                f"No improvement in validation loss. Patience counter: {patience_counter}/{patience}"
+            )
+        if patience_counter >= patience:
+            print(f"Early stopping triggered. No improvement for {patience} epochs.")
+            break
 
     total_end_time = time.time()
     print("Training finished.")
@@ -312,7 +329,7 @@ def dice_coefficient(y_pred, y_true, smooth=1e-6):
 # Main execution
 if __name__ == "__main__":
     # Parameters
-    organ_list = ["liver"]  # Change to the organ you want to segment
+    organ_list = ["spleen"]  # Change to the organ you want to segment
     batch_size = 8
     num_epochs = 30
     learning_rate = 1e-4
@@ -331,10 +348,18 @@ if __name__ == "__main__":
     test_set = pd.read_csv(os.path.join(data_path, "split", "test_dataset.csv"))
     # Create datasets
     for organ_name in organ_list:
+        output_dir = (
+            Path(output_dir)
+            / f"{organ_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         if organ_name.lower() not in organ_to_key:
             print(f"Organ '{organ_name}' not found in the dataset. Skipping...")
             continue
-        train_dataset = BTCVSliceDataset(train_set, organ_name, binary=True)
+        train_dataset = BTCVSliceDataset(
+            train_set, organ_name, organ_threshold=0.05, binary=True
+        )
         val_dataset = BTCVSliceDataset(test_set, organ_name, binary=True)
 
         # Create dataloaders
