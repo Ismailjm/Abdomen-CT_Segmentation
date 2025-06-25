@@ -16,6 +16,12 @@ from tqdm import tqdm
 from functools import lru_cache
 from datetime import datetime
 import time
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+)
 
 # Add Unet directory to path if needed
 sys.path.append("../Unet")
@@ -97,7 +103,7 @@ def save_progress_plots(history, epoch, num_epochs, organ_name, output_dir):
 # Custom dataset for BTCV slices
 class BTCVSliceDataset(Dataset):
     def __init__(
-        self, dataset, organ_name, transform=None, organ_threshold=0.02, binary=True
+        self, dataset, organ_name, transform=None, organ_threshold=0, binary=True
     ):
         """
         Args:
@@ -246,6 +252,9 @@ def train_model(
         "val_loss": [],
         "train_dice_scores": [],
         "val_dice_scores": [],
+        "val_precision": [],
+        "val_recall": [],
+        "val_f1": [],
     }
 
     total_start_time = time.time()
@@ -269,12 +278,14 @@ def train_model(
             else:
                 model.eval()
                 dataloader = val_loader
+                all_val_preds = []
+                all_val_masks = []
 
             running_loss = 0.0
             running_dice = 0.0
 
             # Iterate over data
-            for volumes, masks in tqdm(dataloader):
+            for volumes, masks in tqdm(dataloader, desc=f"{phase.capitalize()} phase"):
                 volumes = volumes.to(device)
                 masks = masks.to(device)
 
@@ -302,6 +313,10 @@ def train_model(
                 running_loss += loss.item() * volumes.size(0)
                 running_dice += dice * volumes.size(0)
 
+                if phase == "val":
+                    all_val_preds.append(preds.view(-1).cpu())
+                    all_val_masks.append(masks.view(-1).cpu())
+
             # Calculate epoch metrics
             epoch_loss = running_loss / len(dataloader.dataset)
             epoch_dice = running_dice / len(dataloader.dataset)
@@ -315,7 +330,26 @@ def train_model(
             else:
                 history["val_loss"].append(epoch_loss)
                 history["val_dice_scores"].append(epoch_dice.cpu())
+                all_preds_tensor = torch.cat(all_val_preds)
+                all_masks_tensor = torch.cat(all_val_masks)
 
+                # Convert to NumPy arrays for scikit-learn
+                y_true = all_masks_tensor.numpy()
+                y_pred = all_preds_tensor.numpy()
+
+                # Calculate precision, recall, and F1 score
+                precision = precision_score(y_true, y_pred, zero_division=0)
+                recall = recall_score(y_true, y_pred, zero_division=0)
+                f1 = f1_score(y_true, y_pred, zero_division=0)
+
+                # Store metricin history
+                history["val_precision"].append(precision)
+                history["val_recall"].append(recall)
+                history["val_f1"].append(f1)
+
+                print(
+                    f"Validation Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}"
+                )
             # Save progress plots
             print(f"\nSaving progress plots at epoch {epoch + 1}...")
             save_progress_plots(history, epoch, num_epochs, organ_name, output_dir)
@@ -363,9 +397,6 @@ if __name__ == "__main__":
     # Parameters
     organ_list = [
         "spleen",
-        "liver",
-        "left kidney",
-        "right kidney",
     ]  # Change to the organ you want to segment
     batch_size = 8
     num_epochs = 30
@@ -393,7 +424,7 @@ if __name__ == "__main__":
             print(f"Organ '{organ_name}' not found in the dataset. Skipping...")
             continue
         train_dataset = BTCVSliceDataset(
-            train_set, organ_name, organ_threshold=0.02, binary=True
+            train_set, organ_name, organ_threshold=0.12, binary=True
         )
         val_dataset = BTCVSliceDataset(test_set, organ_name, binary=True)
 
