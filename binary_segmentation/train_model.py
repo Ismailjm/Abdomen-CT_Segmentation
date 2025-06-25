@@ -114,18 +114,21 @@ class BTCVSliceDataset(Dataset):
 
         self.volumes = {}
         self.masks = {}
-        # Get unique vlomues/masks paths
-        key_to_organ, organ_to_key = organ_mapper()
-        organ_key = organ_to_key[organ_name.lower()]
+        _, organ_to_key = organ_mapper()
+        self.organ_key = organ_to_key[organ_name.lower()]
 
+        # Get unique volmues/masks paths
         unique_volumes_paths = dataset["img_path"].unique()
         unique_masks_paths = dataset["mask_path"].unique()
         for path in tqdm(unique_volumes_paths, desc="Loading volumes"):
             self.volumes[path] = nib.load(path).get_fdata(dtype=np.float32)
 
-        for path in tqdm(unique_masks_paths, desc="Loading masks"):
-            self.masks[path] = nib.load(path).get_fdata(dtype=np.float32)
-        # Flatten the dataset to access slices directly
+        # Load masks and create binary masks for the specified organ
+        if self.binary:
+            for path in tqdm(unique_masks_paths, desc="Loading masks"):
+                self.masks[path] = (
+                    (nib.load(path).get_fdata(dtype=np.float32)) == self.organ_key
+                ).astype(np.float32)
 
         total_slices_found = 0
         slices_kept = 0
@@ -133,15 +136,14 @@ class BTCVSliceDataset(Dataset):
         for _, item in dataset.iterrows():
             if item["organ"].lower() == organ_name.lower():
                 masks_data = self.masks[item["mask_path"]]
+                max_mask_slice = self._extract_max_slice_simple(item)
+                # middle_slice_mask_array = masks_data[:, :, (item["begin_slice"]+item["end_slice"]) // 2]
                 for slice_idx in range(item["begin_slice"], item["end_slice"] + 1):
                     total_slices_found += 1
 
-                    mask_slice_array = masks_data[:, :, slice_idx]
-                    binary_mask_for_organ = mask_slice_array == organ_key
+                    mask_array = masks_data[:, :, slice_idx]
 
-                    organ_perc = (
-                        binary_mask_for_organ.sum() / binary_mask_for_organ.size
-                    )
+                    organ_perc = mask_array.sum() / max_mask_slice.sum()
 
                     # Only add the slice if it meets the threshold
                     if organ_perc >= self.organ_threshold:
@@ -153,6 +155,38 @@ class BTCVSliceDataset(Dataset):
                                 "slice_idx": slice_idx,
                             }
                         )
+        print(f"Total slices found: {total_slices_found}")
+        print(f"Total slices kept: {slices_kept}")
+
+    def _extract_max_slice_simple(self, item):
+        """
+        Finds the slice with the maximum number of foreground pixels for a single volume.
+        """
+        mask_volume = self.masks[item["mask_path"]]
+
+        best_slice_index = -1
+        max_pixel_sum = -1
+
+        # Loop through all the relevant slices for this volume
+        for slice_idx in range(item["begin_slice"], item["end_slice"] + 1):
+            # Get the slice from the pre-loaded volume
+            current_slice = mask_volume[:, :, slice_idx]
+            current_pixel_sum = current_slice.sum()
+
+            # If the current slice is better than the best one seen so far, update it
+            if current_pixel_sum > max_pixel_sum:
+                max_pixel_sum = current_pixel_sum
+                best_slice_index = slice_idx
+
+        # print(
+        #     f"Found best slice at index {best_slice_index} with {max_pixel_sum} pixels."
+        # )
+        # Return the best slice found
+        if best_slice_index != -1:
+            return mask_volume[:, :, best_slice_index]
+        else:
+            # Return an empty slice or handle the case where all slices are empty
+            return np.zeros_like(mask_volume[:, :, 0])
 
     def __len__(self):
         return len(self.slices)
@@ -178,14 +212,10 @@ class BTCVSliceDataset(Dataset):
         vol_slice = clip_and_rescale(vol_array)
         mask_slice = mask_array
         # Create binary mask (organ vs background)
-        if self.binary:
-            key_to_organ, organ_to_key = organ_mapper()
-            organ_key = organ_to_key[self.organ_name.lower()]
-            mask_slice = (mask_slice == organ_key).astype(np.float32)
-
-        # Add channel dimension
-        # img_slice = img_slice[np.newaxis, ...]  # (1, H, W)
-        # mask_slice = mask_slice[np.newaxis, ...]  # (1, H, W)
+        # if self.binary:
+        #     key_to_organ, organ_to_key = organ_mapper()
+        #     organ_key = organ_to_key[self.organ_name.lower()]
+        #     mask_slice = (mask_slice == organ_key).astype(np.float32)
 
         # Convert to torch tensors
         vol_tensor, mask_tensor = to_tensor(vol_slice, mask_slice)
@@ -198,6 +228,7 @@ def train_model(
     model,
     train_loader,
     val_loader,
+    organ_name,
     criterion,
     optimizer,
     num_epochs=25,
@@ -218,7 +249,8 @@ def train_model(
     }
 
     total_start_time = time.time()
-    print("Starting model training...")
+    print("-" * 50)
+    print(f"Starting model training on {organ_name}...")
     print(f"Size of training set: {train_loader.dataset.__len__()}")
     print(f"Size of validation set: {val_loader.dataset.__len__()}")
 
@@ -329,12 +361,16 @@ def dice_coefficient(y_pred, y_true, smooth=1e-6):
 # Main execution
 if __name__ == "__main__":
     # Parameters
-    organ_list = ["spleen"]  # Change to the organ you want to segment
+    organ_list = [
+        "spleen",
+        "liver",
+        "left kidney",
+        "right kidney",
+    ]  # Change to the organ you want to segment
     batch_size = 8
     num_epochs = 30
     learning_rate = 1e-4
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    output_dir = "./results"
 
     # Get organ key from organ name
     key_to_organ, organ_to_key = organ_mapper()
@@ -346,19 +382,18 @@ if __name__ == "__main__":
     data_path = "/home/ismail/projet_PFE/Hands-on-nnUNet/nnUNetFrame/dataset/RawData"
     train_set = pd.read_csv(os.path.join(data_path, "split", "train_dataset.csv"))
     test_set = pd.read_csv(os.path.join(data_path, "split", "test_dataset.csv"))
+    runs_dir = Path("./results") / f"runs_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
     # Create datasets
     for organ_name in organ_list:
-        output_dir = (
-            Path(output_dir)
-            / f"{organ_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
+        output_dir = Path(runs_dir) / f"{organ_name}"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         if organ_name.lower() not in organ_to_key:
             print(f"Organ '{organ_name}' not found in the dataset. Skipping...")
             continue
         train_dataset = BTCVSliceDataset(
-            train_set, organ_name, organ_threshold=0.05, binary=True
+            train_set, organ_name, organ_threshold=0.02, binary=True
         )
         val_dataset = BTCVSliceDataset(test_set, organ_name, binary=True)
 
@@ -382,6 +417,7 @@ if __name__ == "__main__":
             model,
             train_loader,
             val_loader,
+            organ_name,
             criterion,
             optimizer,
             num_epochs=num_epochs,
