@@ -1,3 +1,4 @@
+# Import necessary libraries
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -25,10 +26,16 @@ from sklearn.metrics import (
 
 # Add Unet directory to path if needed
 sys.path.append("../Unet")
-from unet import UNet
+from unet import UNet  # type: ignore
 
 
 def organ_mapper():
+    """
+    Maps organ names to integer keys and vice versa.
+    Returns:
+        key_to_organ (dict): Mapping from integer keys to organ names.
+        organ_to_key (dict): Mapping from organ names to integer keys.
+    """
     label_dict = {
         0: "background",
         1: "spleen",
@@ -51,11 +58,29 @@ def organ_mapper():
 
 
 def clip_and_rescale(ct_array, min_hu=-175, max_hu=250):
+    """
+    Clip and rescale CT array to [0, 1] range.
+    Args:
+        ct_array (np.ndarray): Input CT array.
+        min_hu (int): Minimum Hounsfield unit to clip.
+        max_hu (int): Maximum Hounsfield unit to clip.
+    Returns:
+        np.ndarray: Rescaled array in [0, 1] range.
+    """
     clipped = np.clip(ct_array, min_hu, max_hu)
     return (clipped + abs(min_hu)) / (max_hu + abs(min_hu))
 
 
 def to_tensor(volume, mask):
+    """
+    Convert numpy arrays to PyTorch tensors and add batch dimension.
+    Args:
+        volume (np.ndarray): Input volume array.
+        mask (np.ndarray): Input mask array.
+    Returns:
+        vol_t (torch.Tensor): Volume tensor with shape (1, C, H, W).
+        msk_t (torch.Tensor): Mask tensor with shape (1, C, H, W).
+    """
     vol_t = torch.from_numpy(volume).float().unsqueeze(0)  # or permute channels
     msk_t = torch.from_numpy(mask).float().unsqueeze(0)
     return vol_t, msk_t
@@ -103,7 +128,7 @@ def save_progress_plots(history, epoch, num_epochs, organ_name, output_dir):
 # Custom dataset for BTCV slices
 class BTCVSliceDataset(Dataset):
     def __init__(
-        self, dataset, organ_name, transform=None, organ_threshold=0, binary=True
+        self, dataset, organ_name, by_patient=False, organ_threshold=0, binary=True
     ):
         """
         Args:
@@ -114,7 +139,7 @@ class BTCVSliceDataset(Dataset):
         """
         self.dataset = dataset
         self.organ_name = organ_name
-        self.transform = transform
+        self.by_patient = by_patient
         self.organ_threshold = organ_threshold
         self.binary = binary
 
@@ -195,38 +220,106 @@ class BTCVSliceDataset(Dataset):
             return np.zeros_like(mask_volume[:, :, 0])
 
     def __len__(self):
-        return len(self.slices)
+        if self.by_patient:
+            # If by patient, return the number of unique patients
+            return len(self.masks)
+        else:
+            return len(self.slices)
 
     # @lru_cache(maxsize=30)
     # def _get_volume(self, path):
     #     return nib.load(path).get_fdata(dtype=np.float32)
 
     def __getitem__(self, idx):
-        slice_info = self.slices[idx]
-        volume_path = slice_info["img_path"]
-        mask_path = slice_info["mask_path"]
+        if not self.by_patient:
+            # If not by patient, we can directly access the slice
+            # print(f"Getting item {idx} for organ {self.organ_name}")
+            slice_info = self.slices[idx]
+            # print(f"Slice id {slice_info['slice_idx']} for organ {self.organ_name}")
+            volume_path = slice_info["img_path"]
+            mask_path = slice_info["mask_path"]
 
-        # Load 3D volume
-        volume = self.volumes[volume_path]
-        mask = self.masks[mask_path]
+            # Load 3D volume
+            volume = self.volumes[volume_path]
+            mask = self.masks[mask_path]
 
-        # Get the specific slice
-        vol_array = volume[:, :, slice_info["slice_idx"]].astype(np.float32)  # (H, W)
-        mask_array = mask[:, :, slice_info["slice_idx"]].astype(np.float32)  # (H, W)
+            # Get the specific slice
+            vol_array = volume[:, :, slice_info["slice_idx"]].astype(
+                np.float32
+            )  # (H, W)
+            mask_array = mask[:, :, slice_info["slice_idx"]].astype(
+                np.float32
+            )  # (H, W)
 
-        # Normalize image to [0, 1]
-        vol_slice = clip_and_rescale(vol_array)
-        mask_slice = mask_array
-        # Create binary mask (organ vs background)
-        # if self.binary:
-        #     key_to_organ, organ_to_key = organ_mapper()
-        #     organ_key = organ_to_key[self.organ_name.lower()]
-        #     mask_slice = (mask_slice == organ_key).astype(np.float32)
+            # Normalize image to [0, 1]
+            vol_slice = clip_and_rescale(vol_array)
+            mask_slice = mask_array
+            # Create binary mask (organ vs background)0
+            # if self.binary:
+            #     key_to_organ, organ_to_key = organ_mapper()
+            #     organ_key = organ_to_key[self.organ_name.lower()]
+            #     mask_slice = (mask_slice == organ_key).astype(np.float32)
 
-        # Convert to torch tensors
-        vol_tensor, mask_tensor = to_tensor(vol_slice, mask_slice)
+            # Convert to torch tensors
+            vol_tensor, mask_tensor = to_tensor(vol_slice, mask_slice)
 
-        return vol_tensor, mask_tensor
+            return vol_tensor, mask_tensor
+
+        else:
+            # Access to volumes and masks by idx and return 3d as tensors
+            mask = list(self.masks.values())[idx]
+            volume = list(self.volumes.values())[idx]
+            volume = clip_and_rescale(volume)
+            vol_tensor, mask_tensor = to_tensor(volume, mask)
+
+            return vol_tensor, mask_tensor
+
+
+def eval_model_by_patient(model, val_loader, device, all_patient_metrics):
+
+    with torch.no_grad():
+        for volume, mask in tqdm(val_loader, desc="Evaluating by patient"):
+            predicted_slices = []
+            # print(
+            #     f"Processing patient with volume shape: {volume.shape} and mask shape: {mask.shape}"
+            # )
+            mask_3d = mask.squeeze()  # Remove batch dimension if present
+            # print(f"Volume shape: {volume.shape}, Mask shape: {mask_3d.shape}")
+            for i in range(volume.shape[4]):
+                vol_slice = volume[:, :, :, :, i].to(device)
+
+                output = model(vol_slice)
+                probs = torch.sigmoid(output)
+                preds_2d = (probs > 0.5).float()
+
+                predicted_slices.append(preds_2d.squeeze().cpu())
+
+            # Stack the 2D predictions to form a 3D mask
+            predicted_volume = torch.stack(predicted_slices, dim=2)
+            ground_truth_volume = mask_3d.cpu()
+            # Calculate metrics
+            dice_3d = dice_coefficient(predicted_volume, ground_truth_volume)
+
+            y_true_flat = ground_truth_volume.flatten().numpy()
+            y_pred_flat = predicted_volume.flatten().numpy()
+            precision_3d = precision_score(y_true_flat, y_pred_flat, zero_division=0)
+            recall_3d = recall_score(y_true_flat, y_pred_flat, zero_division=0)
+            f1_3d = f1_score(y_true_flat, y_pred_flat, zero_division=0)
+
+            # Append this patient's metrics to our lists
+            all_patient_metrics["dice"].append(dice_3d.item())
+            all_patient_metrics["precision"].append(precision_3d)
+            all_patient_metrics["recall"].append(recall_3d)
+            all_patient_metrics["f1"].append(f1_3d)
+
+    # Calculate the average metrics across all patients
+    avg_metrics = {key: np.mean(values) for key, values in all_patient_metrics.items()}
+
+    print("\n--- Final 3D Evaluation Metrics (Averaged over all patients) ---")
+    for key, value in avg_metrics.items():
+        print(f"Average {key.capitalize()}: {value:.4f}")
+
+    return avg_metrics, all_patient_metrics
 
 
 # Training function
@@ -234,11 +327,14 @@ def train_model(
     model,
     train_loader,
     val_loader,
+    patient_val_loader,
     organ_name,
     criterion,
     optimizer,
+    by_patient=False,
     num_epochs=25,
     patience=5,
+    min_delta=0.01,
     device="cuda",
     output_dir="./results",
 ):
@@ -246,6 +342,7 @@ def train_model(
 
     # Initialize metrics tracking
     best_val_loss = float("inf")
+    min_delta = min_delta  # Minimum change in loss to qualify as an improvement
     patience_counter = 0
     history = {
         "train_loss": [],
@@ -256,6 +353,13 @@ def train_model(
         "val_recall": [],
         "val_f1": [],
     }
+    all_patient_metrics = {
+        "dice": [],
+        "precision": [],
+        "recall": [],
+        "f1": [],
+    }
+    phases = ["train", "val"]  # if not by_patient else ["train"]
 
     total_start_time = time.time()
     print("-" * 50)
@@ -271,11 +375,11 @@ def train_model(
         print("-" * 10)
 
         # Each epoch has training and validation phase
-        for phase in ["train", "val"]:
+        for phase in phases:
             if phase == "train":
                 model.train()
                 dataloader = train_loader
-            else:
+            elif phase == "val":
                 model.eval()
                 dataloader = val_loader
                 all_val_preds = []
@@ -284,7 +388,29 @@ def train_model(
             running_loss = 0.0
             running_dice = 0.0
 
+            # if phase == "val_patient":
+            #     model.eval()
+            #     dataloader = val_loader
+            #     print(f"Evaluating by patient for {organ_name}...")
+            #     metrics, all_patient_metrics = eval_model_by_patient(
+            #         model, dataloader, device, all_patient_metrics
+            #     )
+
+            #     metrics_json = {
+            #         key: (
+            #             [val.item() for val in value]
+            #             if isinstance(value[0], torch.Tensor)
+            #             else value
+            #         )
+            #         for key, value in all_patient_metrics.items()
+            #     }
+
+            #     with open(
+            #         output_dir / f"eval_by_patient_metrics_{organ_name}.json", "w"
+            #     ) as f:
+            #         json.dump(metrics_json, f, indent=4)
             # Iterate over data
+
             for volumes, masks in tqdm(dataloader, desc=f"{phase.capitalize()} phase"):
                 volumes = volumes.to(device)
                 masks = masks.to(device)
@@ -327,7 +453,7 @@ def train_model(
             if phase == "train":
                 history["train_loss"].append(epoch_loss)
                 history["train_dice_scores"].append(epoch_dice.cpu())
-            else:
+            elif phase == "val":
                 history["val_loss"].append(epoch_loss)
                 history["val_dice_scores"].append(epoch_dice.cpu())
                 all_preds_tensor = torch.cat(all_val_preds)
@@ -355,7 +481,7 @@ def train_model(
             save_progress_plots(history, epoch, num_epochs, organ_name, output_dir)
 
         # Save best model
-        if epoch_loss < best_val_loss:
+        if epoch_loss < best_val_loss - min_delta:
             best_val_loss = epoch_loss
             patience_counter = 0
             # Save the best model
@@ -370,6 +496,26 @@ def train_model(
             print(f"Early stopping triggered. No improvement for {patience} epochs.")
             break
 
+    if by_patient:
+        model.eval()
+        dataloader = patient_val_loader
+        print(f"Evaluating by patient for {organ_name}...")
+        metrics, all_patient_metrics = eval_model_by_patient(
+            model, dataloader, device, all_patient_metrics
+        )
+
+        metrics_json = {
+            key: (
+                [val.item() for val in value]
+                if isinstance(value[0], torch.Tensor)
+                else value
+            )
+            for key, value in all_patient_metrics.items()
+        }
+
+        with open(output_dir / f"eval_by_patient_metrics_{organ_name}.json", "w") as f:
+            json.dump(metrics_json, f, indent=4)
+
     total_end_time = time.time()
     print("Training finished.")
     total_duration_seconds = total_end_time - total_start_time
@@ -380,7 +526,7 @@ def train_model(
 
     # Save final model
     torch.save(model.state_dict(), output_dir / f"final_unet_{organ_name}.pth")
-    return model, history, total_duration_seconds
+    return history, all_patient_metrics, total_duration_seconds
 
 
 # Dice coefficient for evaluation
@@ -392,30 +538,38 @@ def dice_coefficient(y_pred, y_true, smooth=1e-6):
     return (2.0 * intersection + smooth) / (y_pred.sum() + y_true.sum() + smooth)
 
 
-# Main execution
-if __name__ == "__main__":
-    # Parameters
-    organ_list = [
-        "spleen",
-    ]  # Change to the organ you want to segment
-    batch_size = 8
-    num_epochs = 30
-    learning_rate = 1e-4
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+def train_loop(
+    organ_list,
+    data_path,
+    batch_size=8,
+    num_epochs=100,
+    learning_rate=1e-4,
+    device="cuda",
+    by_patient=True,
+    organ_threshold=0.05,
+    min_delta=0.01,
+):
+    """
+    Main training loop for the UNet model.
+    Args:
+        organ_list: List of organs to train on
+        data_path: Path to the dataset
+        batch_size: Batch size for training
+        num_epochs: Number of epochs to train
+        learning_rate: Learning rate for the optimizer
+        device: Device to use for training (cuda or cpu)
+        by_patient: Whether to evaluate by patient or not
+        organ_threshold: Threshold for organ presence in slices
+    """
     # Get organ key from organ name
     key_to_organ, organ_to_key = organ_mapper()
 
-    # Load dataset
-    # Make sure to parse the string representation of lists if loaded from CSV
-    # if isinstance(train_df, pd.DataFrame) and "organs" in train_df.columns:
-    #     train_df["organs"] = train_df["organs"].apply(ast.literal_eval)
-    data_path = "/home/ismail/projet_PFE/Hands-on-nnUNet/nnUNetFrame/dataset/RawData"
+    # Load CSVs
     train_set = pd.read_csv(os.path.join(data_path, "split", "train_dataset.csv"))
-    test_set = pd.read_csv(os.path.join(data_path, "split", "test_dataset.csv"))
+    val_set = pd.read_csv(os.path.join(data_path, "split", "test_dataset.csv"))
     runs_dir = Path("./results") / f"runs_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    # Create datasets
+    # Train the model for each organ
     for organ_name in organ_list:
         output_dir = Path(runs_dir) / f"{organ_name}"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -423,18 +577,29 @@ if __name__ == "__main__":
         if organ_name.lower() not in organ_to_key:
             print(f"Organ '{organ_name}' not found in the dataset. Skipping...")
             continue
-        train_dataset = BTCVSliceDataset(
-            train_set, organ_name, organ_threshold=0.12, binary=True
-        )
-        val_dataset = BTCVSliceDataset(test_set, organ_name, binary=True)
 
-        # Create dataloaders
+        # Create Dataloaders
+        train_dataset = BTCVSliceDataset(
+            train_set, organ_name, organ_threshold=organ_threshold, binary=True
+        )
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
+        )
+        val_dataset = BTCVSliceDataset(
+            val_set, organ_name, by_patient=False, binary=True
         )
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False, num_workers=4
         )
+
+        if by_patient:
+            # If by_patient, we need to create a DataLoader that groups by patient
+            patient_val_dataset = BTCVSliceDataset(
+                val_set, organ_name, by_patient=True, binary=True
+            )
+            patient_val_loader = DataLoader(
+                patient_val_dataset, batch_size=1, shuffle=False, num_workers=4
+            )
 
         # Initialize model
         model = UNet(in_channels=1, out_channels=1).to(device)
@@ -444,14 +609,17 @@ if __name__ == "__main__":
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
         # Train model
-        model, history, total_duration_seconds = train_model(
+        history, all_patient_metrics, total_duration_seconds = train_model(
             model,
             train_loader,
             val_loader,
+            patient_val_loader,
             organ_name,
             criterion,
             optimizer,
+            by_patient=by_patient,
             num_epochs=num_epochs,
+            min_delta=min_delta,
             device=device,
             output_dir=output_dir,
         )
@@ -461,7 +629,7 @@ if __name__ == "__main__":
         history_for_json = {
             key: (
                 [val.item() for val in value]
-                if isinstance(value[0], torch.Tensor)
+                if value and isinstance(value[0], torch.Tensor)
                 else value
             )
             for key, value in history.items()
@@ -498,3 +666,62 @@ if __name__ == "__main__":
         plt.tight_layout(rect=[0, 0.03, 1, 0.93])
         plt.savefig(output_dir / f"training_history_{organ_name}.png")
         plt.show()
+        plt.close()
+
+        plt.figure(figsize=(5, 5))
+        plt.plot(
+            all_patient_metrics["dice"],
+            label="Dice Score",
+            color="blue",
+            marker="o",
+        )
+        plt.plot(
+            all_patient_metrics["precision"],
+            label="Precision",
+            color="green",
+            marker="o",
+        )
+        plt.plot(
+            all_patient_metrics["recall"],
+            label="Recall",
+            color="orange",
+            marker="o",
+        )
+        plt.plot(
+            all_patient_metrics["f1"],
+            label="F1 Score",
+            color="red",
+            marker="o",
+        )
+        plt.xlabel("Patient Index")
+        plt.ylabel("Score")
+        plt.legend()
+
+        # Adjust layout to prevent the main title from overlapping with subplots
+        plt.title(f"Patient-wise Evaluation Metrics for {organ_name}")
+        plt.show()
+        plt.savefig(output_dir / f"Metrics_per_patient_{organ_name}.png")
+        print(f"Training completed for {organ_name}. Results saved in {output_dir}.")
+
+
+# Main execution
+if __name__ == "__main__":
+    # Parameters
+    organ_list = [
+        "spleen",
+        "liver",
+        "right kidney",
+        "left kidney",
+    ]
+    data_path = "/home/ismail/projet_PFE/Hands-on-nnUNet/nnUNetFrame/dataset/RawData"
+    organ_threshold = [0.05, 0.1, 0.15]  # Threshold for organ presence in slices
+
+    # Run training loop
+    for threshold in organ_threshold:
+        print(f"Training with organ threshold: {threshold}")
+        train_loop(
+            organ_list,
+            data_path,
+            organ_threshold=threshold,
+            min_delta=0.01,
+        )
