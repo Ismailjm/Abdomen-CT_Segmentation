@@ -175,6 +175,7 @@ class BTCVSliceDataset(Dataset):
                     mask_array = masks_data[:, :, slice_idx]
 
                     organ_perc = mask_array.sum() / max_mask_slice.sum()
+                    avg_white_percent += mask_array.sum()
 
                     # Only add the slice if it meets the threshold
                     if organ_perc >= self.organ_threshold:
@@ -186,6 +187,10 @@ class BTCVSliceDataset(Dataset):
                                 "slice_idx": slice_idx,
                             }
                         )
+                    avg_white_percent = avg_white_percent / (slices_kept * 512 * 512)
+                    print(
+                        f"Average white percentage for {self.organ_name}: {avg_white_percent:.4f}"
+                    )
         print(f"Total slices found: {total_slices_found}")
         print(f"Total slices kept: {slices_kept}")
 
@@ -304,13 +309,13 @@ def eval_model_by_patient(model, val_loader, device, all_patient_metrics):
             y_pred_flat = predicted_volume.flatten().numpy()
             precision_3d = precision_score(y_true_flat, y_pred_flat, zero_division=0)
             recall_3d = recall_score(y_true_flat, y_pred_flat, zero_division=0)
-            f1_3d = f1_score(y_true_flat, y_pred_flat, zero_division=0)
+            # f1_3d = f1_score(y_true_flat, y_pred_flat, zero_division=0)
 
             # Append this patient's metrics to our lists
             all_patient_metrics["dice"].append(dice_3d.item())
             all_patient_metrics["precision"].append(precision_3d)
             all_patient_metrics["recall"].append(recall_3d)
-            all_patient_metrics["f1"].append(f1_3d)
+            # all_patient_metrics["f1"].append(f1_3d)
 
     # Calculate the average metrics across all patients
     avg_metrics = {key: np.mean(values) for key, values in all_patient_metrics.items()}
