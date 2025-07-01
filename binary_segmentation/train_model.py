@@ -23,6 +23,7 @@ from sklearn.metrics import (
     f1_score,
     classification_report,
 )
+from losses import DiceLoss, DiceBCELoss  # Custom loss functions
 
 # Add Unet directory to path if needed
 sys.path.append("../Unet")
@@ -125,10 +126,40 @@ def save_progress_plots(history, epoch, num_epochs, organ_name, output_dir):
     plt.close()
 
 
+# You can add this class to the top of your train_model.py script
+
+
+class VolumeCache:
+    """
+    A simple cache to load and hold all 3D image volumes in memory once.
+    """
+
+    def __init__(self, dataset_df):
+        self.volumes = {}
+        self._load_volumes(dataset_df)
+
+    def _load_volumes(self, dataset_df):
+        unique_volumes_paths = dataset_df["img_path"].unique()
+        for path in tqdm(
+            unique_volumes_paths, desc="Loading all image volumes into cache"
+        ):
+            if path not in self.volumes:
+                self.volumes[path] = nib.load(path).get_fdata(dtype=np.float32)
+
+    def get_volume(self, path):
+        return self.volumes.get(path)
+
+
 # Custom dataset for BTCV slices
 class BTCVSliceDataset(Dataset):
     def __init__(
-        self, dataset, organ_name, by_patient=False, organ_threshold=0, binary=True
+        self,
+        dataset,
+        organ_name,
+        volume_cache,
+        by_patient=False,
+        organ_threshold=0,
+        binary=True,
     ):
         """
         Args:
@@ -143,17 +174,19 @@ class BTCVSliceDataset(Dataset):
         self.organ_threshold = organ_threshold
         self.binary = binary
 
-        self.volumes = {}
+        self.volumes = (
+            volume_cache.volumes
+        )  # volumes dictionary points to the data in the cache
         self.masks = {}
         _, organ_to_key = organ_mapper()
         self.organ_key = organ_to_key[organ_name.lower()]
 
         # Get unique volmues/masks paths
-        unique_volumes_paths = dataset["img_path"].unique()
-        unique_masks_paths = dataset["mask_path"].unique()
-        for path in tqdm(unique_volumes_paths, desc="Loading volumes"):
-            self.volumes[path] = nib.load(path).get_fdata(dtype=np.float32)
+        # unique_volumes_paths = dataset["img_path"].unique()
+        # for path in tqdm(unique_volumes_paths, desc="Loading volumes"):
+        #     self.volumes[path] = nib.load(path).get_fdata(dtype=np.float32)
 
+        unique_masks_paths = dataset["mask_path"].unique()
         # Load masks and create binary masks for the specified organ
         if self.binary:
             for path in tqdm(unique_masks_paths, desc="Loading masks"):
@@ -161,38 +194,52 @@ class BTCVSliceDataset(Dataset):
                     (nib.load(path).get_fdata(dtype=np.float32)) == self.organ_key
                 ).astype(np.float32)
 
-        total_slices_found = 0
-        slices_kept = 0
-        self.slices = []
-        for _, item in dataset.iterrows():
-            if item["organ"].lower() == organ_name.lower():
-                masks_data = self.masks[item["mask_path"]]
-                max_mask_slice = self._extract_max_slice_simple(item)
-                # middle_slice_mask_array = masks_data[:, :, (item["begin_slice"]+item["end_slice"]) // 2]
-                for slice_idx in range(item["begin_slice"], item["end_slice"] + 1):
-                    total_slices_found += 1
+        if by_patient is False:
+            total_slices_found = 0
+            slices_kept = 0
+            self.slices = []
+            total_organ_pixels_in_kept_slices = 0
+            for _, item in dataset.iterrows():
+                if item["organ"].lower() == organ_name.lower():
+                    masks_data = self.masks[item["mask_path"]]
+                    max_mask_slice = self._extract_max_slice_simple(item)
+                    # middle_slice_mask_array = masks_data[:, :, (item["begin_slice"]+item["end_slice"]) // 2]
+                    for slice_idx in range(item["begin_slice"], item["end_slice"] + 1):
+                        total_slices_found += 1
 
-                    mask_array = masks_data[:, :, slice_idx]
+                        mask_array = masks_data[:, :, slice_idx]
+                        # print(mask_array.shape)
 
-                    organ_perc = mask_array.sum() / max_mask_slice.sum()
-                    avg_white_percent += mask_array.sum()
+                        organ_perc = mask_array.sum() / max_mask_slice.sum()
 
-                    # Only add the slice if it meets the threshold
-                    if organ_perc >= self.organ_threshold:
-                        slices_kept += 1
-                        self.slices.append(
-                            {
-                                "img_path": item["img_path"],
-                                "mask_path": item["mask_path"],
-                                "slice_idx": slice_idx,
-                            }
-                        )
-                    avg_white_percent = avg_white_percent / (slices_kept * 512 * 512)
-                    print(
-                        f"Average white percentage for {self.organ_name}: {avg_white_percent:.4f}"
-                    )
-        print(f"Total slices found: {total_slices_found}")
-        print(f"Total slices kept: {slices_kept}")
+                        # Only add the slice if it meets the threshold
+                        if organ_perc >= self.organ_threshold:
+                            slices_kept += 1
+                            total_organ_pixels_in_kept_slices += mask_array.sum()
+                            self.slices.append(
+                                {
+                                    "img_path": item["img_path"],
+                                    "mask_path": item["mask_path"],
+                                    "slice_idx": slice_idx,
+                                }
+                            )
+            if slices_kept > 0:
+                total_pixels_in_kept_slices = slices_kept * 512 * 512
+                # print(
+                #     f"Total organ pixels in kept slices: {total_organ_pixels_in_kept_slices}"
+                # )
+                # print(f"Total pixels in kept slices: {total_pixels_in_kept_slices}")
+                self.avg_white_percent = (
+                    total_organ_pixels_in_kept_slices / total_pixels_in_kept_slices
+                )
+
+            else:
+                self.avg_white_percent = 0
+            print(
+                f"Average white percentage for {self.organ_name}: {self.avg_white_percent:.4f}"
+            )
+            print(f"Total slices found: {total_slices_found}")
+            print(f"Total slices kept: {slices_kept}")
 
     def _extract_max_slice_simple(self, item):
         """
@@ -362,7 +409,6 @@ def train_model(
         "dice": [],
         "precision": [],
         "recall": [],
-        "f1": [],
     }
     phases = ["train", "val"]  # if not by_patient else ["train"]
 
@@ -471,16 +517,14 @@ def train_model(
                 # Calculate precision, recall, and F1 score
                 precision = precision_score(y_true, y_pred, zero_division=0)
                 recall = recall_score(y_true, y_pred, zero_division=0)
-                f1 = f1_score(y_true, y_pred, zero_division=0)
+                # f1 = f1_score(y_true, y_pred, zero_division=0)
 
                 # Store metricin history
                 history["val_precision"].append(precision)
                 history["val_recall"].append(recall)
-                history["val_f1"].append(f1)
+                # history["val_f1"].append(f1)
 
-                print(
-                    f"Validation Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}"
-                )
+                print(f"Validation Precision: {precision:.4f}, Recall: {recall:.4f}")
             # Save progress plots
             print(f"\nSaving progress plots at epoch {epoch + 1}...")
             save_progress_plots(history, epoch, num_epochs, organ_name, output_dir)
@@ -546,6 +590,7 @@ def dice_coefficient(y_pred, y_true, smooth=1e-6):
 def train_loop(
     organ_list,
     data_path,
+    loss_function,
     batch_size=8,
     num_epochs=100,
     learning_rate=1e-4,
@@ -574,6 +619,12 @@ def train_loop(
     val_set = pd.read_csv(os.path.join(data_path, "split", "test_dataset.csv"))
     runs_dir = Path("./results") / f"runs_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+    # Create the Volume Cache ONCE before the loops
+    print("Creating volume cache for training set...")
+    train_volume_cache = VolumeCache(train_set)
+
+    print("Creating volume cache for validation set...")
+    val_volume_cache = VolumeCache(val_set)
     # Train the model for each organ
     for organ_name in organ_list:
         output_dir = Path(runs_dir) / f"{organ_name}"
@@ -585,13 +636,17 @@ def train_loop(
 
         # Create Dataloaders
         train_dataset = BTCVSliceDataset(
-            train_set, organ_name, organ_threshold=organ_threshold, binary=True
+            train_set,
+            organ_name,
+            train_volume_cache,
+            organ_threshold=organ_threshold,
+            binary=True,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
         )
         val_dataset = BTCVSliceDataset(
-            val_set, organ_name, by_patient=False, binary=True
+            val_set, organ_name, val_volume_cache, by_patient=False, binary=True
         )
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False, num_workers=4
@@ -600,7 +655,7 @@ def train_loop(
         if by_patient:
             # If by_patient, we need to create a DataLoader that groups by patient
             patient_val_dataset = BTCVSliceDataset(
-                val_set, organ_name, by_patient=True, binary=True
+                val_set, organ_name, val_volume_cache, by_patient=True, binary=True
             )
             patient_val_loader = DataLoader(
                 patient_val_dataset, batch_size=1, shuffle=False, num_workers=4
@@ -608,9 +663,17 @@ def train_loop(
 
         # Initialize model
         model = UNet(in_channels=1, out_channels=1).to(device)
-
+        if loss_function == "BCE":
+            criterion = nn.BCEWithLogitsLoss()
+        elif loss_function == "Dice":
+            criterion = DiceLoss()
+        elif loss_function == "DiceBCELoss":
+            criterion = DiceBCELoss(dice_weight=0.5, bce_weight=0.5)
+        else:
+            raise ValueError(
+                f"Unknown loss function: {loss_function}. Choose from 'BCE', 'Dice', or 'DiceBCELoss'."
+            )
         # Loss function and optimizer
-        criterion = nn.BCEWithLogitsLoss()
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
         # Train model
@@ -651,7 +714,7 @@ def train_loop(
         # Plot training history
         plt.figure(figsize=(12, 5))
         plt.suptitle(
-            f"Training History for {organ_name}\nTotal Training Time: {time_str}"
+            f"Training History for {organ_name}\nTotal Training Time: {time_str}\nLoss Function: {loss_function}, Organ Threshold: {organ_threshold:.2f}\n Average White Percent: {train_dataset.avg_white_percent:.4f}",
         )
         plt.subplot(1, 2, 1)
         plt.plot(history["train_loss"], label="Train Loss")
@@ -692,12 +755,12 @@ def train_loop(
             color="orange",
             marker="o",
         )
-        plt.plot(
-            all_patient_metrics["f1"],
-            label="F1 Score",
-            color="red",
-            marker="o",
-        )
+        # plt.plot(
+        #     all_patient_metrics["f1"],
+        #     label="F1 Score",
+        #     color="red",
+        #     marker="o",
+        # )
         plt.xlabel("Patient Index")
         plt.ylabel("Score")
         plt.legend()
@@ -720,13 +783,23 @@ if __name__ == "__main__":
     ]
     data_path = "/home/ismail/projet_PFE/Hands-on-nnUNet/nnUNetFrame/dataset/RawData"
     organ_threshold = [0.05, 0.1, 0.15]  # Threshold for organ presence in slices
+    loss_configs = ["BCE", "Dice", "DiceBCELoss"]
+
+    # train_set_df = pd.read_csv(os.path.join(data_path, "split", "train_dataset.csv"))
+    # val_set_df = pd.read_csv(os.path.join(data_path, "split", "test_dataset.csv"))
 
     # Run training loop
     for threshold in organ_threshold:
-        print(f"Training with organ threshold: {threshold}")
-        train_loop(
-            organ_list,
-            data_path,
-            organ_threshold=threshold,
-            min_delta=0.01,
-        )
+        for loss_function in loss_configs:
+            print(f"\n{'='*25}")
+            print(
+                f"STARTING NEW RUN: Threshold={threshold}, Loss Function={loss_function}"
+            )
+            print(f"{'='*25}\n")
+            train_loop(
+                organ_list,
+                data_path,
+                loss_function,
+                organ_threshold=threshold,
+                min_delta=0.01,
+            )
