@@ -20,14 +20,26 @@ import time
 from sklearn.metrics import (
     precision_score,
     recall_score,
-    f1_score,
-    classification_report,
 )
 from losses import DiceLoss, DiceBCELoss  # Custom loss functions
+import random
 
 # Add Unet directory to path if needed
 sys.path.append("../Unet")
 from unet import UNet  # type: ignore
+
+
+def set_seed(seed_value=42):
+    """Set seed for reproducibility."""
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)  # for multi-GPU
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed_value)
+    print(f"Random seed set to {seed_value}")
 
 
 def organ_mapper():
@@ -439,29 +451,6 @@ def train_model(
             running_loss = 0.0
             running_dice = 0.0
 
-            # if phase == "val_patient":
-            #     model.eval()
-            #     dataloader = val_loader
-            #     print(f"Evaluating by patient for {organ_name}...")
-            #     metrics, all_patient_metrics = eval_model_by_patient(
-            #         model, dataloader, device, all_patient_metrics
-            #     )
-
-            #     metrics_json = {
-            #         key: (
-            #             [val.item() for val in value]
-            #             if isinstance(value[0], torch.Tensor)
-            #             else value
-            #         )
-            #         for key, value in all_patient_metrics.items()
-            #     }
-
-            #     with open(
-            #         output_dir / f"eval_by_patient_metrics_{organ_name}.json", "w"
-            #     ) as f:
-            #         json.dump(metrics_json, f, indent=4)
-            # Iterate over data
-
             for volumes, masks in tqdm(dataloader, desc=f"{phase.capitalize()} phase"):
                 volumes = volumes.to(device)
                 masks = masks.to(device)
@@ -541,7 +530,9 @@ def train_model(
             print(
                 f"No improvement in validation loss. Patience counter: {patience_counter}/{patience}"
             )
-        if patience_counter >= patience:
+        if (
+            patience_counter >= patience and patience != -1
+        ):  # Handle case where patience is -1 (no early stopping)
             print(f"Early stopping triggered. No improvement for {patience} epochs.")
             break
 
@@ -591,6 +582,7 @@ def train_loop(
     organ_list,
     data_path,
     loss_function,
+    state_dict=None,
     batch_size=8,
     num_epochs=100,
     learning_rate=1e-4,
@@ -598,6 +590,8 @@ def train_loop(
     by_patient=True,
     organ_threshold=0.05,
     min_delta=0.01,
+    patience=5,
+    seed=42,
 ):
     """
     Main training loop for the UNet model.
@@ -611,13 +605,19 @@ def train_loop(
         by_patient: Whether to evaluate by patient or not
         organ_threshold: Threshold for organ presence in slices
     """
+    # Set seed for reproducibility
+    set_seed(seed)
+
     # Get organ key from organ name
     key_to_organ, organ_to_key = organ_mapper()
 
     # Load CSVs
     train_set = pd.read_csv(os.path.join(data_path, "split", "train_dataset.csv"))
     val_set = pd.read_csv(os.path.join(data_path, "split", "test_dataset.csv"))
-    runs_dir = Path("./results") / f"runs_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    runs_dir = (
+        Path("/home/ieljamiy/code/organ_Unet/results_classic_git_version")
+        / f"runs_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
 
     # Create the Volume Cache ONCE before the loops
     print("Creating volume cache for training set...")
@@ -651,7 +651,7 @@ def train_loop(
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False, num_workers=4
         )
-
+        patient_val_loader = None
         if by_patient:
             # If by_patient, we need to create a DataLoader that groups by patient
             patient_val_dataset = BTCVSliceDataset(
@@ -663,6 +663,12 @@ def train_loop(
 
         # Initialize model
         model = UNet(in_channels=1, out_channels=1).to(device)
+        torch.save(model.state_dict(), output_dir / f"initial_unet_{organ_name}.pth")
+        if state_dict:
+            model_weights = torch.load(state_dict)
+            # Load the state dict into the model
+            model.load_state_dict(model_weights)
+
         if loss_function == "BCE":
             criterion = nn.BCEWithLogitsLoss()
         elif loss_function == "Dice":
@@ -687,6 +693,7 @@ def train_loop(
             optimizer,
             by_patient=by_patient,
             num_epochs=num_epochs,
+            patience=patience,
             min_delta=min_delta,
             device=device,
             output_dir=output_dir,
@@ -736,70 +743,102 @@ def train_loop(
         plt.show()
         plt.close()
 
-        plt.figure(figsize=(5, 5))
-        plt.plot(
-            all_patient_metrics["dice"],
-            label="Dice Score",
-            color="blue",
-            marker="o",
-        )
-        plt.plot(
-            all_patient_metrics["precision"],
-            label="Precision",
-            color="green",
-            marker="o",
-        )
-        plt.plot(
-            all_patient_metrics["recall"],
-            label="Recall",
-            color="orange",
-            marker="o",
-        )
-        # plt.plot(
-        #     all_patient_metrics["f1"],
-        #     label="F1 Score",
-        #     color="red",
-        #     marker="o",
-        # )
-        plt.xlabel("Patient Index")
-        plt.ylabel("Score")
-        plt.legend()
+        if by_patient:
+            plt.figure(figsize=(5, 5))
+            plt.plot(
+                all_patient_metrics["dice"],
+                label="Dice Score",
+                color="blue",
+                marker="o",
+            )
+            plt.plot(
+                all_patient_metrics["precision"],
+                label="Precision",
+                color="green",
+                marker="o",
+            )
+            plt.plot(
+                all_patient_metrics["recall"],
+                label="Recall",
+                color="orange",
+                marker="o",
+            )
+            # plt.plot(
+            #     all_patient_metrics["f1"],
+            #     label="F1 Score",
+            #     color="red",
+            #     marker="o",
+            # )
+            plt.xlabel("Patient Index")
+            plt.ylabel("Score")
+            plt.legend()
 
-        # Adjust layout to prevent the main title from overlapping with subplots
-        plt.title(f"Patient-wise Evaluation Metrics for {organ_name}")
-        plt.show()
-        plt.savefig(output_dir / f"Metrics_per_patient_{organ_name}.png")
+            # Adjust layout to prevent the main title from overlapping with subplots
+            plt.title(f"Patient-wise Evaluation Metrics for {organ_name}")
+            plt.show()
+            plt.savefig(output_dir / f"Metrics_per_patient_{organ_name}.png")
+
         print(f"Training completed for {organ_name}. Results saved in {output_dir}.")
+        with open(output_dir / "training_settings.json", "w") as f:
+            json.dump(
+                {
+                    "organs": organ_name,
+                    "dataset size": {
+                        "Training": len(train_dataset),
+                        "Validation": len(val_dataset),
+                    },
+                    "Initial model state dict": state_dict,
+                    "by_patient": by_patient,
+                    "threshold": organ_threshold,
+                    "epochs": num_epochs,
+                    "early stopping patience": patience,
+                    "batch_size": batch_size,
+                    "learning rate": learning_rate,
+                    "loss function": loss_function,
+                    "seed": seed,
+                    "device": device,
+                },
+                f,
+                indent=4,
+            )
 
 
 # Main execution
 if __name__ == "__main__":
     # Parameters
     organ_list = [
-        "spleen",
         "liver",
-        "right kidney",
-        "left kidney",
     ]
-    data_path = "/home/ismail/projet_PFE/Hands-on-nnUNet/nnUNetFrame/dataset/RawData"
-    organ_threshold = [0.05, 0.1, 0.15]  # Threshold for organ presence in slices
-    loss_configs = ["BCE", "Dice", "DiceBCELoss"]
+    data_path = "/home/ieljamiy/RawData"
+    state_dict = "/home/ieljamiy/code/organ_Unet/results_classic_git_version/runs_20250723_172204/liver/initial_unet_liver.pth"
+    organ_threshold = [0.1]  # Threshold for organ presence in slices
+    loss_configs = ["BCE"]
+    seed_value = 42
 
     # train_set_df = pd.read_csv(os.path.join(data_path, "split", "train_dataset.csv"))
     # val_set_df = pd.read_csv(os.path.join(data_path, "split", "test_dataset.csv"))
+    # random_seeds = [random.randint(1, 100) for _ in range(3)]
 
     # Run training loop
     for threshold in organ_threshold:
         for loss_function in loss_configs:
+            # for seed_value in random_seeds:
             print(f"\n{'='*25}")
             print(
-                f"STARTING NEW RUN: Threshold={threshold}, Loss Function={loss_function}"
+                f"STARTING NEW RUN: Threshold={threshold}, Loss Function={loss_function}, Seed={seed_value}"
             )
             print(f"{'='*25}\n")
             train_loop(
                 organ_list,
                 data_path,
                 loss_function,
+                state_dict=None,
+                batch_size=8,
+                num_epochs=20,
+                learning_rate=0.001,
+                by_patient=False,
                 organ_threshold=threshold,
                 min_delta=0.01,
+                patience=-1,
+                seed=seed_value,
             )
