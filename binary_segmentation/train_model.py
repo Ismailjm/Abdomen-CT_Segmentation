@@ -29,6 +29,7 @@ sys.path.append("../Unet")
 from unet import UNet  # type: ignore
 from argparse import ArgumentParser
 
+
 def set_seed(seed_value=42):
     """Set seed for reproducibility."""
     random.seed(seed_value)
@@ -530,7 +531,9 @@ def train_model(
             print(
                 f"No improvement in validation loss. Patience counter: {patience_counter}/{patience}"
             )
-        if patience_counter >= patience and patience != -1: # Handle case where patience is -1 (no early stopping)
+        if (
+            patience_counter >= patience and patience != -1
+        ):  # Handle case where patience is -1 (no early stopping)
             print(f"Early stopping triggered. No improvement for {patience} epochs.")
             break
 
@@ -606,15 +609,20 @@ def train_loop(
     """
     # Set seed for reproducibility
     set_seed(seed)
-    
+
     # Get organ key from organ name
     key_to_organ, organ_to_key = organ_mapper()
 
     # Load CSVs
     train_set = pd.read_csv(os.path.join(data_path, "split", "train_dataset.csv"))
-    val_set = pd.read_csv(os.path.join(data_path, "split", "test_dataset.csv"))
-    
-    runs_dir = Path("/home/ieljamiy/code/results_classic_BTCV") / "experiments_no_load_checkpoint" / output_folder / str(seed)
+    val_set = pd.read_csv(os.path.join(data_path, "split", "val_dataset.csv"))
+
+    runs_dir = (
+        Path("/home/ieljamiy/code/results_classic_BTCV")
+        / "experiments_no_load_checkpoint"
+        / output_folder
+        / str(seed)
+    )
     # f"runs_{datetime.now().strftime('%Y%m%d_%H%M%S')}
 
     # Create the Volume Cache ONCE before the loops
@@ -644,7 +652,12 @@ def train_loop(
             train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
         )
         val_dataset = BTCVSliceDataset(
-            val_set, organ_name, val_volume_cache, organ_threshold=organ_threshold, by_patient=False, binary=True
+            val_set,
+            organ_name,
+            val_volume_cache,
+            organ_threshold=organ_threshold,
+            by_patient=False,
+            binary=True,
         )
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False, num_workers=4
@@ -662,11 +675,11 @@ def train_loop(
         # Initialize model
         model = UNet(in_channels=1, out_channels=1).to(device)
         torch.save(model.state_dict(), output_dir / f"initial_unet_{organ_name}.pth")
-        if state_dict :
+        if state_dict:
             model_weights = torch.load(state_dict)
             # Load the state dict into the model
             model.load_state_dict(model_weights)
-        
+
         if loss_function == "BCE":
             criterion = nn.BCEWithLogitsLoss()
         elif loss_function == "Dice":
@@ -775,13 +788,16 @@ def train_loop(
             plt.title(f"Patient-wise Evaluation Metrics for {organ_name}")
             plt.show()
             plt.savefig(output_dir / f"Metrics_per_patient_{organ_name}.png")
-            
+
         print(f"Training completed for {organ_name}. Results saved in {output_dir}.")
         with open(output_dir / "training_settings.json", "w") as f:
             json.dump(
                 {
                     "organs": organ_name,
-                    "dataset size": {'Training': len(train_dataset), 'Validation': len(val_dataset)},
+                    "dataset size": {
+                        "Training": len(train_dataset),
+                        "Validation": len(val_dataset),
+                    },
                     "Initial model state dict": state_dict,
                     "by_patient": by_patient,
                     "threshold": organ_threshold,
@@ -818,10 +834,6 @@ if __name__ == "__main__":
     lrs = [0.0001, 0.001, 0.005]
 
     parser = ArgumentParser(description="Train UNet for organ segmentation")
-    
-    # train_set_df = pd.read_csv(os.path.join(data_path, "split", "train_dataset.csv"))
-    # val_set_df = pd.read_csv(os.path.join(data_path, "split", "test_dataset.csv"))
-    # random_seeds = [random.randint(1, 100) for _ in range(3)]
 
     # Run training loop
     for threshold in organ_threshold:
@@ -833,10 +845,10 @@ if __name__ == "__main__":
                         f"STARTING NEW RUN: Threshold={threshold}, Batch Size={batch_size}, Learning Rate={lr}"
                     )
                     print(f"{'='*25}\n")
-                    
+
                     # Create a unique folder name for this run
                     folder_name = f"thresh_Train-{threshold}_batch-{batch_size}_lr-{lr}"
-                    
+
                     # Call the training loop with the current parameters
                     train_loop(
                         organ_list,
@@ -851,5 +863,5 @@ if __name__ == "__main__":
                         organ_threshold=threshold,
                         min_delta=0.01,
                         patience=-1,
-                        seed=seed
+                        seed=seed,
                     )
