@@ -339,8 +339,17 @@ class BTCVSliceDataset(Dataset):
     def sample_k_from_dataset(self, k_shots, seed=None, batch_size=None):
         if seed is not None:
             random.seed(seed)
-        slices_indices = random.sample(range(len(self)), k_shots)
-        subset = [self.slices[i] for i in slices_indices]
+        # slices_indices = random.sample(range(len(self)), k_shots)
+        # subset = [self.slices[i] for i in slices_indices]
+        
+        # --- FOR FAIR COMPARISON WITH CLASSIC ---
+        subset = []
+        list_of_indices = [77, 80, 81, 84, 85, 87, 88, 95, 97, 98]
+        for i in range(len(self)):
+            if self.slices[i]["slice_idx"] in list_of_indices:
+                subset.append(self.slices[i])
+                if len(subset) == k_shots:
+                    break
         vol_tensors = []
         mask_tensors = []
         for slice_info in subset:
@@ -366,7 +375,10 @@ class BTCVSliceDataset(Dataset):
             mask_tensors.append(mask_tensor)
         vol_tensors = torch.stack(vol_tensors)
         mask_tensors = torch.stack(mask_tensors)
-        return vol_tensors, mask_tensors
+        # --- FOR FAIR COMPARISON WITH CLASSIC ---
+        return vol_tensors, mask_tensors, subset
+        # --- END FOR FAIR COMPARISON WITH CLASSIC ---
+        # return vol_tensors, mask_tensors --- IGNORE ---
 
 
 def set_seed(seed_value):
@@ -700,10 +712,12 @@ def test_loop(args, device):
     unique_patients = list(dataset["patient_id"].unique())
     random.shuffle(unique_patients)
 
-    train_set = dataset[dataset["patient_id"] == unique_patients[0]]
-    val_set = dataset[dataset["patient_id"] == unique_patients[1]]
-    test_set = dataset[dataset["patient_id"] == unique_patients[2]]
-
+    # train_set = dataset[dataset["patient_id"] == unique_patients[0]]
+    # val_set = dataset[dataset["patient_id"] == unique_patients[1]]
+    # test_set = dataset[dataset["patient_id"] == unique_patients[2]]
+    train_set = dataset[dataset["patient_id"] == "img_003_0000.nii"]
+    val_set = dataset[dataset["patient_id"] == "img_020_0000.nii"]
+    test_set = dataset[dataset["patient_id"] == "img_000_0000.nii"]
     train_volume_cache = VolumeCache(train_set)
     val_volume_cache = VolumeCache(val_set)
     test_volume_cache = VolumeCache(test_set)
@@ -765,7 +779,6 @@ def test_loop(args, device):
                 val_loader,
                 test_loader,
                 args,
-                in_channels=args.in_channels,
                 output_dir=runs_dir,
                 state_dict=file,
                 device=device,
